@@ -4,14 +4,13 @@ import argparse
 import json
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.error import URLError
-from urllib.request import urlopen
 
 import tomlkit
 
@@ -20,9 +19,11 @@ CONFIG_PATH = Path(os.environ.get("CODEX_MODE_CONFIG", "~/.codex/config.toml")).
 PROFILES_PATH = Path(os.environ.get("CODEX_MODE_PROFILES", "~/.codex/codex-mode-profiles.json")).expanduser()
 BACKUP_DIR = Path(os.environ.get("CODEX_MODE_BACKUP_DIR", "~/.codex/backups")).expanduser()
 CODEX_BIN = os.environ.get("CODEX_MODE_CODEX_BIN", "codex")
-PROXY_BIN = os.environ.get("CODEX_MODE_PROXY_BIN", "codex-chat-proxy")
+CODEX_APP = os.environ.get("CODEX_MODE_CODEX_APP", "/Applications/Codex.app")
+PROXY_BIN = os.environ.get("CODEX_MODE_PROXY_BIN") or shutil.which("codeproxy") or "codeproxy"
 PROXY_HOST = os.environ.get("CODEX_MODE_PROXY_HOST", "127.0.0.1")
-PROXY_PORT = int(os.environ.get("CODEX_MODE_PROXY_PORT", "18089"))
+PROXY_PORT = int(os.environ.get("CODEX_MODE_PROXY_PORT", "8787"))
+PROXY_CONFIG = Path(os.environ.get("CODEX_MODE_PROXY_CONFIG", "~/.codeproxy/config.json")).expanduser()
 
 
 def load_profiles() -> dict:
@@ -37,6 +38,27 @@ def save_profiles(data: dict) -> None:
     tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     tmp.replace(PROFILES_PATH)
     PROFILES_PATH.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+
+def write_proxy_config(profile: dict) -> None:
+    """Write a codeproxy config file from a stored profile."""
+    PROXY_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    config = {
+        "version": "1",
+        "currentUpstream": profile.get("provider", "deepseek"),
+        "upstreams": {
+            profile.get("provider", "deepseek"): {
+                "format": "openai-chat",
+                "baseUrl": profile["base_url"].rstrip("/"),
+                "apiKey": profile["api_key"],
+                "model": profile.get("model", "deepseek-v4-pro"),
+            }
+        },
+    }
+    tmp = PROXY_CONFIG.with_suffix(PROXY_CONFIG.suffix + ".tmp")
+    tmp.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(PROXY_CONFIG)
+    PROXY_CONFIG.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
 
 def command_add(args) -> int:
@@ -76,13 +98,15 @@ def command_api(args) -> int:
         print(f"Unknown profile: {args.profile}", file=sys.stderr)
         return 2
 
+    write_proxy_config(profile)
+
     config = load_config()
     backup_config()
     config["model"] = profile["model"]
-    config["model_provider"] = "chat_proxy"
+    config["model_provider"] = "codeproxy"
     providers = config.setdefault("model_providers", tomlkit.table())
-    provider = providers.setdefault("chat_proxy", tomlkit.table())
-    provider["name"] = "Codex Chat Proxy"
+    provider = providers.setdefault("codeproxy", tomlkit.table())
+    provider["name"] = "Codeproxy"
     provider["base_url"] = f"http://{PROXY_HOST}:{PROXY_PORT}/v1"
     provider["wire_api"] = "responses"
     provider["requires_openai_auth"] = False
@@ -113,7 +137,7 @@ def command_status(_args) -> int:
     data = load_profiles()
     config = load_config()
     active = data.get("active_profile")
-    if config.get("model_provider") == "chat_proxy" and active:
+    if config.get("model_provider") == "codeproxy" and active:
         profile = data.get("profiles", {}).get(active, {})
         print(f"Mode: api ({active})")
         print(f"Model: {profile.get('model', config.get('model'))}")
@@ -133,23 +157,33 @@ def command_run(args) -> int:
 
     proxy_cmd = [
         PROXY_BIN,
-        "serve",
+        "--config",
+        str(PROXY_CONFIG),
         "--host",
         PROXY_HOST,
         "--port",
         str(PROXY_PORT),
-        "--profile-file",
-        str(PROFILES_PATH),
-        "--profile",
-        profile,
     ]
-    if os.environ.get("CODEX_MODE_RUN_LOG"):
+
+    def proxy_healthy():
+        try:
+            with socket.create_connection((PROXY_HOST, PROXY_PORT), timeout=0.5):
+                return True
+        except OSError:
+            return False
+
+    if proxy_healthy():
+        proxy_proc = None
+    elif os.environ.get("CODEX_MODE_RUN_LOG"):
         subprocess.call(proxy_cmd)
         proxy_proc = None
     else:
         proxy_proc = subprocess.Popen(proxy_cmd)
     try:
         wait_for_proxy(PROXY_HOST, PROXY_PORT, timeout=5.0)
+        if args.app:
+            subprocess.call(["open", CODEX_APP])
+            return 0
         codex_cmd = [CODEX_BIN, "--dangerously-bypass-approvals-and-sandbox", *args.codex_args]
         return subprocess.call(codex_cmd)
     finally:
@@ -184,15 +218,13 @@ def wait_for_proxy(host: str, port: int, timeout: float) -> None:
     if os.environ.get("CODEX_MODE_RUN_LOG"):
         return
     deadline = time.time() + timeout
-    url = f"http://{host}:{port}/healthz"
     while time.time() < deadline:
         try:
-            with urlopen(url, timeout=0.5) as response:
-                if response.status == 200:
-                    return
-        except URLError:
+            with socket.create_connection((host, port), timeout=0.5):
+                return
+        except OSError:
             time.sleep(0.1)
-    raise RuntimeError(f"proxy did not become healthy at {url}")
+    raise RuntimeError(f"proxy did not start on {host}:{port}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -221,6 +253,7 @@ def build_parser() -> argparse.ArgumentParser:
     status.set_defaults(func=command_status)
 
     run = subparsers.add_parser("run")
+    run.add_argument("--app", action="store_true", help="Launch Codex desktop app instead of CLI")
     run.add_argument("codex_args", nargs=argparse.REMAINDER)
     run.set_defaults(func=command_run)
     return parser
@@ -230,7 +263,9 @@ def main(argv=None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     if argv and argv[0] == "run":
-        return command_run(argparse.Namespace(codex_args=argv[1:]))
+        app = "--app" in argv
+        codex_args = [a for a in argv[1:] if a != "--app"]
+        return command_run(argparse.Namespace(app=app, codex_args=codex_args))
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)

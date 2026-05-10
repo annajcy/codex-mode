@@ -18,6 +18,8 @@ def run_tool(root: Path, *args):
     env["CODEX_MODE_BACKUP_DIR"] = str(root / "backups")
     env["CODEX_MODE_CODEX_BIN"] = str(root / "fake-codex")
     env["CODEX_MODE_PROXY_BIN"] = str(root / "fake-proxy")
+    env["CODEX_MODE_PROXY_PORT"] = "18787"
+    env["CODEX_MODE_PROXY_CONFIG"] = str(root / "proxy-config.json")
     env["CODEX_MODE_RUN_LOG"] = str(root / "run-log.json")
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
@@ -83,13 +85,17 @@ def test_api_switch_updates_codex_config_and_preserves_unrelated_tables():
         assert result.returncode == 0, result.stderr
         config = read_toml(root / "config.toml")
         assert config["model"] == "chat-model"
-        assert config["model_provider"] == "chat_proxy"
+        assert config["model_provider"] == "codeproxy"
         assert config["plugins"]["demo"]["enabled"] is True
-        provider = config["model_providers"]["chat_proxy"]
-        assert provider["base_url"] == "http://127.0.0.1:18089/v1"
+        provider = config["model_providers"]["codeproxy"]
+        assert provider["base_url"] == "http://127.0.0.1:18787/v1"
         assert provider["wire_api"] == "responses"
         assert provider["requires_openai_auth"] is False
         assert any((root / "backups").iterdir())
+        # Proxy config file was written
+        proxy_config = json.loads((root / "proxy-config.json").read_text())
+        assert proxy_config["upstreams"]["custom"]["baseUrl"] == "https://chat.example"
+        assert proxy_config["upstreams"]["custom"]["model"] == "chat-model"
 
 
 def test_sub_switch_restores_chatgpt_mode():
@@ -115,6 +121,6 @@ def test_run_starts_proxy_then_codex_with_dangerous_bypass():
 
         assert result.returncode == 0, result.stderr
         log = json.loads((root / "run-log.json").read_text())
-        assert log[0][:4] == ["proxy", "serve", "--host", "127.0.0.1"]
-        assert log[0][-2:] == ["--profile", "deepseek"]
+        assert log[0][:2] == ["proxy", "--config"]
+        assert "--port" in log[0]
         assert log[1] == ["codex", "--dangerously-bypass-approvals-and-sandbox", "Say OK"]

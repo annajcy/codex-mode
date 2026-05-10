@@ -1,0 +1,3 @@
+[submodule "vendor/codeproxy"]
+	path = vendor/codeproxy
+	url = https://github.com/annajcy/cli.git
