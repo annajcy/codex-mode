@@ -151,9 +151,12 @@ def command_status(_args) -> int:
 def command_run(args) -> int:
     data = load_profiles()
     profile = data.get("active_profile")
+
     if not profile:
-        print("No active API profile. Run `codex-mode api <profile>` first.", file=sys.stderr)
-        return 2
+        if args.app:
+            subprocess.call(["open", CODEX_APP])
+            return 0
+        return subprocess.call([CODEX_BIN, *args.codex_args])
 
     proxy_cmd = [
         PROXY_BIN,
