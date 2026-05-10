@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+dist/
+build/
+*.egg-info/
+codex-mode-profiles.json
+config.toml
+config.toml.bak-*
